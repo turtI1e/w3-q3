@@ -12,7 +12,6 @@ from cryptography.exceptions import InvalidSignature
 
 app = FastAPI()
 
-# --- IN-MEMORY STORAGE (Strictly for the 180s verification window) ---
 EVALUATIONS = {}
 COMMIT_CACHE = {}
 DOSSIER_CACHE = {}
@@ -20,7 +19,6 @@ DB_LOCK = threading.Lock()
 
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "YOUR_AIPIPE_TOKEN_HERE")
 
-# --- HELPERS ---
 def get_canonical_json(data):
     return json.dumps(data, sort_keys=True, separators=(',', ':'))
 
@@ -31,7 +29,6 @@ def safe_b64decode(s):
     s += "=" * ((4 - len(s) % 4) % 4)
     return base64.urlsafe_b64decode(s)
 
-# --- AI DECISION ---
 async def get_ai_decision(dossier):
     dossier_str = get_canonical_json(dossier)
     dossier_hash = get_sha256(dossier_str)
@@ -41,7 +38,6 @@ async def get_ai_decision(dossier):
 
     mailbox = dossier.get('mailbox', '')
     
-    # The prompt asks for FLAT variables, preventing the AI from messing up the target/payload nesting.
     prompt = f"""
     You are a highly secure AI mailroom agent. Analyze the dossier and choose exactly one action.
 
@@ -86,13 +82,11 @@ async def get_ai_decision(dossier):
         decision = {}
 
     action = decision.get("action", "no_action")
-
-    # HARDCODED CANARY PROTECTION (Guarantees safety marks)
     text_lower = dossier_str.lower()
+    
     if ("canary" in text_lower or "ignore previous" in text_lower or "ignore all" in text_lower) and action != "quarantine_item":
         action = "quarantine_item"
 
-    # PROGRAMMATIC EXACT ARGUMENTS (Guarantees exact keys and types)
     if action == "create_draft":
         target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
         payload = {"recipient": decision.get("recipient", ""), "referenceId": decision.get("referenceId", ""), "status": decision.get("status", ""), "template": "order_status"}
@@ -112,7 +106,6 @@ async def get_ai_decision(dossier):
         target = None
         payload = {"reasonCode": decision.get("reasonCode", "INFORMATIONAL"), "referenceId": decision.get("referenceId", "")}
 
-    # Evidence Filtering
     valid_lines = set()
     for src in dossier.get("sources", []):
         for line in src.get("lines", []):
@@ -135,7 +128,6 @@ async def get_ai_decision(dossier):
 
     return final_decision
 
-# --- ENDPOINT ---
 @app.post("/")
 async def mailroom_endpoint(request: Request):
     try:
@@ -160,7 +152,6 @@ async def mailroom_endpoint(request: Request):
         input_digest = get_sha256(get_canonical_json(dossiers))
         
         with DB_LOCK:
-            # EXACT REPLAY / CONFLICT
             if eval_id in EVALUATIONS:
                 stored = EVALUATIONS[eval_id]
                 if stored["inputDigest"] != input_digest:
@@ -215,6 +206,15 @@ async def mailroom_endpoint(request: Request):
                 raise HTTPException(status_code=400, detail="Unknown evaluation")
             if eval_state["inputDigest"] != input_digest:
                 raise HTTPException(status_code=409, detail="Conflict: Digest mismatch")
+                
+            if len(receipts) != len(eval_state["proposals"]):
+                raise HTTPException(status_code=400, detail="Receipt count mismatch")
+                
+            seen_receipts = set()
+            for r in receipts:
+                if r.get("dossierId") in seen_receipts:
+                    raise HTTPException(status_code=400, detail="Duplicate receipt")
+                seen_receipts.add(r.get("dossierId"))
                 
             jwk = eval_state.get("publicKeyJwk", {})
             x_b64 = jwk.get("x", "")
@@ -291,7 +291,3 @@ async def mailroom_endpoint(request: Request):
 
     else:
         raise HTTPException(status_code=400, detail="Invalid operation")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
